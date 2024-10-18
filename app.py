@@ -84,6 +84,11 @@ def web(query: str, request_id=None):
     keep_warm=1,
 )
 def qanda(query: str, request_id=None, with_logging: bool = False) -> str:
+   
+   
+   
+   
+   
     """Runs sourced Q&A for a query using LangChain.
 
     Arguments:
@@ -91,6 +96,90 @@ def qanda(query: str, request_id=None, with_logging: bool = False) -> str:
         request_id: A unique identifier for the request.
         with_logging: If True, logs the interaction to Gantry.
     """
+    @stub.function(
+    image=image,
+    network_file_systems={
+        str(VECTOR_DIR): vector_storage,
+    },
+    keep_warm=1,
+)
+def qanda(query: str, request_id=None, with_logging: bool = False) -> str:
+    """Runs sourced Q&A for a query using LangChain.
+
+    Arguments:
+        query: The query to run Q&A on.
+        request_id: A unique identifier for the request.
+        with_logging: If True, logs the interaction to Gantry.
+    """
+    from langchain.chains.qa_with_sources import load_qa_with_sources_chain
+    from langchain.chat_models import ChatOpenAI
+    import prompts
+    import vecstore
+
+    # Ensure the query is valid
+    if not isinstance(query, str) or len(query.strip()) == 0:
+        raise ValueError("The query must be a non-empty string.")
+
+    embedding_engine = vecstore.get_embedding_engine(allowed_special="all")
+
+    try:
+        pretty_log("connecting to vector storage")
+        vector_index = vecstore.connect_to_vector_index(
+            vecstore.INDEX_NAME, embedding_engine
+        )
+        pretty_log("connected to vector storage")
+        pretty_log(f"found {vector_index.index.ntotal} vectors to search over")
+
+    except Exception as e:
+        raise RuntimeError(f"Error connecting to vector storage: {e}")
+
+    try:
+        pretty_log(f"running on query: {query}")
+        pretty_log("selecting sources by similarity to query")
+        sources_and_scores = vector_index.similarity_search_with_score(query, k=3)
+    except Exception as e:
+        raise RuntimeError(f"Error during similarity search: {e}")
+
+    if not sources_and_scores:
+        raise RuntimeError("No relevant sources found for the query.")
+
+    sources, scores = zip(*sources_and_scores)
+
+    pretty_log("running query against Q&A chain")
+
+    try:
+        llm = ChatOpenAI(model_name="gpt-4", temperature=0, max_tokens=256)
+        chain = load_qa_with_sources_chain(
+            llm,
+            chain_type="stuff",
+            verbose=with_logging,
+            prompt=prompts.main,
+            document_variable_name="sources",
+        )
+
+        result = chain(
+            {"input_documents": sources, "question": query}, return_only_outputs=True
+        )
+        answer = result["output_text"]
+
+    except Exception as e:
+        raise RuntimeError(f"Error running Q&A chain: {e}")
+
+    # Logging results to Gantry (optional)
+    if with_logging:
+        try:
+            pretty_log("logging results to gantry")
+            record_key = log_event(query, sources, answer, request_id=request_id)
+            if record_key:
+                pretty_log(f"logged to gantry with key {record_key}")
+        except Exception as e:
+            pretty_log(f"Error logging to Gantry: {e}")
+            raise RuntimeError(f"Gantry logging failed: {e}")
+
+    return answer
+
+    
+    
     from langchain.chains.qa_with_sources import load_qa_with_sources_chain
     from langchain.chat_models import ChatOpenAI
 
@@ -214,6 +303,41 @@ def prep_documents_for_vector_storage(documents):
     Arguments:
         documents: A list of LangChain.Documents with text, metadata, and a hash ID.
     """
+    
+
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+    # Using the RecursiveCharacterTextSplitter for splitting the document text into chunks
+    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=500,       # Size of each chunk (tokens)
+        chunk_overlap=100,    # Overlap between consecutive chunks
+        allowed_special="all" # Include special tokens
+    )
+
+    # Initialize lists to hold ids, texts, and metadata
+    ids, texts, metadatas = [], [], []
+
+    for document in documents:
+        # Extract the text and metadata from each document
+        text, metadata = document["text"], document["metadata"]
+        
+        # Split the document text into smaller chunks
+        doc_texts = text_splitter.split_text(text)
+        
+        # Metadata is duplicated for each chunk
+        doc_metadatas = [metadata] * len(doc_texts)
+        
+        # Append the document's hash ID, text chunks, and corresponding metadata to lists
+        ids += [metadata.get("sha256")] * len(doc_texts)
+        texts += doc_texts
+        metadatas += doc_metadatas
+
+    # Return the processed document chunks along with metadata and ids
+    return ids, texts, metadatas
+
+    
+    
+    
     from langchain.text_splitter import RecursiveCharacterTextSplitter
 
     text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
